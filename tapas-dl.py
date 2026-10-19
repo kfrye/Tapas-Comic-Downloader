@@ -4,8 +4,11 @@ from pathlib import Path
 import os
 import argparse
 import re
+import time
 import requests
 import http.cookiejar
+import img2pdf
+from urllib.parse import urlparse
 
 
 def lead0(num, max):
@@ -37,6 +40,11 @@ def printLine(msg='', noNewLine=False):
         print(msg + (' ' * spaces))
 
 
+def file_extension(url):
+    # Only look at the path, the signed query string can contain dots too
+    return os.path.splitext(urlparse(url).path)[1][1:]
+
+
 def check_path(path, slash=True, fat=False):
     evil_chars = []
     if slash:
@@ -46,8 +54,67 @@ def check_path(path, slash=True, fat=False):
     return ''.join([char for char in path if char not in evil_chars])
 
 
+def image_ok(data):
+    # img2pdf can only embed JPEG and PNG data as it is
+    return data.startswith(b'\xff\xd8') or data.startswith(b'\x89PNG')
+
+
+RETRY_STATUS_CODES = (403, 429, 500, 502, 503, 504)
+
+
+def fetch(url, what):
+    # Wait before every request. If tapas refuses or rate limits us, back off and try again.
+    # A 403 is retried without a limit, the wait grows up to 10 minutes between tries.
+    attempt = 0
+    while True:
+        time.sleep(args.delay)
+        try:
+            response = s.get(url, timeout=60)
+            if response.status_code not in RETRY_STATUS_CODES:
+                return response
+            reason = 'HTTP {}'.format(response.status_code)
+            forbidden = response.status_code == 403
+        except requests.RequestException as e:
+            response = None
+            reason = str(e)
+            forbidden = False
+        if not forbidden and attempt >= args.retries:
+            return response
+        wait = min(5 * 2 ** attempt, 600)
+        printLine('{}: {}, retrying in {}s...'.format(what, reason, wait))
+        time.sleep(wait)
+        attempt += 1
+
+
+def episode_page(episodeId, what):
+    response = fetch(f'https://tapas.io/episode/{episodeId}', what)
+    if response is None or response.status_code != 200:
+        return None
+    return pq(response.content)
+
+
+def load_episode_list(seriesId):
+    data = []
+    episodePage = 1
+    while True:
+        # Large max_limit values (e.g. 99999999) make the API answer with HTTP 500, so page through it instead
+        response = fetch(f'https://tapas.io/series/{seriesId}/episodes?page={episodePage}&sort=OLDEST&max_limit=20', 'Episode list')
+        if response is None or response.status_code != 200:
+            return None
+        try:
+            episodes = response.json()['data']
+        except ValueError:
+            return None
+        page = pq(episodes['body'])
+        for episode in page('[data-permalink*="/episode/"]'):
+            data.append({'id': int(episode.attrib['data-permalink'][episode.attrib['data-permalink'].rfind('/') + 1:])})
+        if not episodes['pagination']['has_next']:
+            return data
+        episodePage += 1
+
+
 # parse input and settup help
-parser = argparse.ArgumentParser(description='Downloads Comics from \'https://tapas.io\'.\nIf folder of downloaded comic is found, it will only update (can be disabled with -f/--force).', formatter_class=argparse.RawTextHelpFormatter)
+parser = argparse.ArgumentParser(description='Downloads Comics from \'https://tapas.io\'.\nIf folder of downloaded comic is found, it will only download the episodes that are missing (can be disabled with -f/--force).', formatter_class=argparse.RawTextHelpFormatter)
 parser.add_argument('url', metavar='URL/name', type=str, nargs='+',
                     help='URL or URL name to comic\nGo to the comic you want to download (any page)\nRightclick on the comic name in the upper left corner and select "Copy linkaddress" (Or similar) or just use the name behind series in the url\nExamples: https://tapas.io/series/Erma, RavenWolf, ...')
 parser.add_argument('-f', '--force', action="store_true", help='Disables updater.')
@@ -57,6 +124,10 @@ parser.add_argument('-c', '--cookies', type=str, nargs='?', default="", dest='co
                     help='Optional cookies.txt file to load, can be used to allow the script to "log in" and circumvent age verification.')
 parser.add_argument('-o', '--output-dir', type=str, nargs='?', default="", dest='baseDir', metavar='PATH',
                     help='Output directory where comics should be placed.\nIf left blank, the script folder will be used.')
+parser.add_argument('-d', '--delay', type=float, default=0.5, dest='delay', metavar='SECONDS',
+                    help='Seconds to wait before each request to tapas.io (default: 0.5).')
+parser.add_argument('-R', '--retries', type=int, default=5, dest='retries', metavar='N',
+                    help='How often to retry a rate limited or failed request, waiting longer each time (default: 5). 403 errors are retried until they succeed.')
 
 args = parser.parse_args()
 
@@ -73,8 +144,10 @@ basePath = ""
 if (args.baseDir):
     basePath = Path(args.baseDir)
 
-for urlCount, url in enumerate(args.url):
+
+def download_series(url, urlCount, urlTotal):
     # check url/name
+    url = url.rstrip('/')
     if re.match(r'^https://tapas\.io/series/.+$', url):
         urlName = url[url.rindex('/') + 1:]
     else:
@@ -83,11 +156,12 @@ for urlCount, url in enumerate(args.url):
     printLine('Loading ' + urlName + '...', True)
 
     # Get comic start page and test if comic exsists
-    pageReqest = s.get('https://tapas.io/series/' + urlName)
+    pageReqest = fetch('https://tapas.io/series/' + urlName, 'Series page')
 
-    if pageReqest.status_code != 200:
-        printLine('Error: Comic "{}" not found\n'.format(urlName))
-        break
+    if pageReqest is None or pageReqest.status_code != 200:
+        status = 'no response' if pageReqest is None else 'HTTP {}'.format(pageReqest.status_code)
+        printLine('Error: Comic "{}" could not be loaded ({})\n'.format(urlName, status))
+        return False
 
     page = pq(pageReqest.text)
 
@@ -102,11 +176,10 @@ for urlCount, url in enumerate(args.url):
     else:
         headerSrc = None
 
-    data = []
-    page = pq(s.get(f'https://tapas.io/series/{seriesId}/episodes?page=1&sort=OLDEST&max_limit=99999999')  # It's over 9000! But I love that they forgot to limit the max_limit, because that means I don't have to bother with pagination ^^
-              .json()['data']['body'])
-    for episode in page('[data-permalink*="/episode/"]'):
-        data.append({'id': int(episode.attrib['data-permalink'][episode.attrib['data-permalink'].rfind('/') + 1:])})
+    data = load_episode_list(seriesId)
+    if data is None:
+        printLine('Error: Could not load the episode list of "{}", try again later\n'.format(urlName))
+        return True
 
     printLine('{} [{}] ({} pages):'.format(name, urlName, len(data)))
 
@@ -118,110 +191,111 @@ for urlCount, url in enumerate(args.url):
         savePath = os.path.join(basePath, savePath)
         printLine('Full path is: ' + str(savePath))
     if os.path.isdir(savePath) and not args.force:
-        printLine('Found directory, only updating (use -f/--force to disable)')
-
-        filesInDir = list(os.scandir(savePath))
-
-        fileNames = []
-        for fileInDir in filesInDir:
-            fileNames.append(fileInDir.name)
-        fileNames.sort()
-
-        imgOffset = len(fileNames)
-
-        if imgOffset > 1:
-            lastFile = fileNames[-1]
-            lastPageId = int(lastFile[lastFile.rindex('#') + 1:lastFile.rindex('.')])
-
-            pageOffset = next(i for i, page in enumerate(data) if page['id'] == lastPageId) + 1
-
-            data = data[pageOffset:]
-        else:
-            pageOffset = 0
-    else:
-        if not os.path.isdir(savePath):
-            os.mkdir(savePath)
-            printLine('Creating folder...', True)
-
-        pageOffset = 0
-        imgOffset = 0
+        printLine('Found directory, only downloading missing episodes (use -f/--force to disable)')
+    elif not os.path.isdir(savePath):
+        os.makedirs(savePath)
+        printLine('Creating folder...', True)
 
     # Download header
     if True not in [file.name.startswith('-1 - header.') for file in os.scandir(savePath)]:
         printLine('Downloading header...', True)
 
         if headerSrc is not None:
-            with open(os.path.join(savePath, '-1 - header.{}'.format(headerSrc[headerSrc.rindex('.') + 1:])), 'wb') as f:
-                f.write(s.get(headerSrc).content)
+            response = fetch(headerSrc, 'Header')
+            if response is not None and response.status_code == 200:
+                with open(os.path.join(savePath, '-1 - header.{}'.format(file_extension(headerSrc))), 'wb') as f:
+                    f.write(response.content)
 
-            printLine('Downloaded header')
+                printLine('Downloaded header')
+            else:
+                printLine('Error: Header could not be downloaded')
         else:
             printLine('Header not found')
 
     if len(data) <= 0:
-        print('Nothing todo: No pages found or all already downloaded\n')
-        continue
+        print('Nothing todo: No pages found\n')
+        return True
 
-    # Check if series is comic or novel
-    if len(pq(s.get(f'https://tapas.io/episode/{data[0]["id"]}').content)('.content__img.js-lazy')) > 0:
+    # Check if series is comic or novel, based on the first episode that loads
+    kind = None
+    for episode in data:
+        epPage = episode_page(episode['id'], 'Checking episode type')
+        if epPage is None:
+            continue
+        if len(epPage('.content__img.js-lazy')) > 0:
+            kind = 'comic'
+        elif len(epPage('article.viewer__body > div.ep-epub-content p')) > 0:
+            kind = 'novel'
+        if kind is not None:
+            break
+
+    if kind is None:
+        printLine('Error: Could not tell if "{}" is a comic or a novel, no episode could be loaded. Try again later.\n'.format(urlName))
+        return True
+
+    if kind == 'comic':
         printLine('Detected comic')
-        # Get images from page from JS api
-        allImgCount = 0
-        for pageCount, pageData in enumerate(data):
 
-            # Test whether the page we have in mind is reachable
-            pageReqest = s.get(f'https://tapas.io/episode/{pageData["id"]}')
-            if pageReqest.status_code != 200:
-                # This page was unavailable. Let the user know and add a single dummy image entry.
-                # (We will check for this when we go to download images.)
-                printLine('Error: "{}" page {}/{} not found. Page Request yielded: {} (Early Access page?)'.format(urlName, pageCount + pageOffset, len(data) + pageOffset, str(pageReqest.status_code)), True)
+        # Episodes that already have a PDF are skipped, unless -f/--force is used
+        done = set()
+        if not args.force:
+            for fileName in os.listdir(savePath):
+                match = re.search(r'#(\d+)\.pdf$', fileName)
+                if match:
+                    done.add(int(match.group(1)))
 
-                pageData['title'] = "PageUnavailable"
-                pageData['imgs'] = []
-                pageData['imgs'].append("PageUnavailable")
+        saved = 0
+        failed = []
+        for index, episode in enumerate(data, start=1):
+            episodeId = episode['id']
+            if episodeId in done:
+                continue
 
-            else:
-                # If the page did not yield an access error, go ahead an scrape for image entries.
-                pageHtml = pq(s.get(f'https://tapas.io/episode/{pageData["id"]}').content)
+            epPage = episode_page(episodeId, 'Episode {}/{}'.format(index, len(data)))
+            if epPage is None:
+                failed.append((index, episodeId, 'page could not be loaded'))
+                continue
 
-                printLine('Downloaded image data from {} images (pages {}/{})...'.format(allImgCount, pageCount + pageOffset, len(data) + pageOffset), True)
+            title = epPage('.js-ep-title').text() or 'Episode {}'.format(index)
 
-                pageData['title'] = pageHtml('.info__title').text()
-
-                pageData['imgs'] = []
-                for img in pageHtml('.content__img'):
-                    pageData['imgs'].append(pq(img).attr('data-src'))
-
-                    allImgCount += 1
-
-        # Download images
-        imgCount = 0
-        for pageCount, pageData in enumerate(data):
-
-            for imgOfPageCount, img in enumerate(pageData['imgs']):
-
-                # Check if the first image entry is the fummy text that indicates the page was unavailable when we tried to scrape it.
-                if pageData['imgs'][0] != "PageUnavailable":
-                    # If the entry isn't a dummy entry, go ahead and download the images it contains.
-                    with open(os.path.join(savePath, check_path('{} - {} - {} - {} - #{}.{}'.format(lead0(imgCount + imgOffset, allImgCount + imgOffset), lead0(pageCount + pageOffset, len(pageData) + pageOffset),
-                                                                                                    lead0(imgOfPageCount, len(pageData['imgs'])), pageData['title'], pageData['id'], img[img.rindex('.') + 1:]),
-                                                                fat=args.restrict_characters)), 'wb') as f:
-                        f.write(s.get(img).content)
-
-                    imgCount += 1
-
-                    printLine('Downloaded image {}/{} from page {}/{} ({}/{} images)...'.format(imgOfPageCount + 1, len(pageData['imgs']), pageCount + pageOffset, len(data) + pageOffset, imgCount + imgOffset, allImgCount + imgOffset), True)
+            imgUrls = [pq(img).attr('data-src') for img in epPage('.content__img')]
+            if not imgUrls:
+                if 'Unlock episode' in epPage.html():
+                    failed.append((index, episodeId, 'locked, unlock it on tapas.io first'))
                 else:
-                    # If the entry was a dummy entry, skip it and let the user know.
-                    printLine('Error: No images downloaded from page {}/{}.'.format(pageCount + pageOffset, len(data) + pageOffset), True)
+                    failed.append((index, episodeId, 'no images on the page'))
+                continue
 
-        if data != []:
-            printLine('Downloaded {} of {} images'.format(imgCount, allImgCount))
-        else:
-            printLine('Nothing to do')
+            images = []
+            problem = None
+            for imgCount, imgUrl in enumerate(imgUrls, start=1):
+                printLine('Downloading episode {}/{}, image {}/{}...'.format(index, len(data), imgCount, len(imgUrls)), True)
+                response = fetch(imgUrl, 'Episode {}/{}, image {}'.format(index, len(data), imgCount))
+                if response is None or response.status_code != 200:
+                    problem = 'image {} could not be loaded'.format(imgCount)
+                    break
+                if not image_ok(response.content):
+                    problem = 'image {} is not JPEG or PNG'.format(imgCount)
+                    break
+                images.append(response.content)
+            if problem is not None:
+                failed.append((index, episodeId, problem))
+                continue
 
-        if urlCount + 1 != len(args.url):
-            printLine()
+            pdfPath = os.path.join(savePath, check_path('{} - {} - #{}.pdf'.format(lead0(index, len(data)), title, episodeId), fat=args.restrict_characters))
+            # Write to a temporary name first, so an interrupted download is not counted as done
+            with open(pdfPath + '.part', 'wb') as f:
+                f.write(img2pdf.convert(images))
+            os.replace(pdfPath + '.part', pdfPath)
+
+            saved += 1
+            printLine('Saved {} ({} pages)'.format(os.path.basename(pdfPath), len(images)))
+
+        printLine('Saved {} new episodes, {} already there'.format(saved, len(done)))
+        for index, episodeId, problem in failed:
+            printLine('Not downloaded: episode {}/{} (#{}): {}'.format(index, len(data), episodeId, problem))
+        if failed:
+            printLine('Run the same command again to retry them.')
     else:
         printLine('Detected novel')
 
@@ -239,8 +313,9 @@ for urlCount, url in enumerate(args.url):
 
         book.add_author(author)
 
-        header_name = os.path.join(savePath, list(filter(re.compile(r'.+header\..+').match, os.listdir(savePath)))[0])
-        book.set_cover("cover.jpg", open(header_name, 'rb').read())
+        headerFiles = [file for file in os.listdir(savePath) if re.match(r'.+header\..+', file)]
+        if headerFiles:
+            book.set_cover("cover.jpg", open(os.path.join(savePath, headerFiles[0]), 'rb').read())
 
         book.toc = []
         book.spine = ['cover']
@@ -259,7 +334,10 @@ for urlCount, url in enumerate(args.url):
         for pageCount, pageData in enumerate(data):
             printLine('Downloaded page {}/{}...'.format(pageCount + 1, len(data)), True)
 
-            pagePq = pq(s.get(f'https://tapas.io/episode/{pageData["id"]}').content)
+            pagePq = episode_page(pageData['id'], 'Episode {}/{}'.format(pageCount + 1, len(data)))
+            if pagePq is None:
+                printLine('Error: Episode {}/{} (#{}) could not be loaded, it is missing from the novel'.format(pageCount + 1, len(data), pageData['id']))
+                continue
             pageTitle = pagePq('.viewer__header > .title').text()
 
             pageHtml = f'<h1>{pageTitle}</h1>'
@@ -288,10 +366,14 @@ for urlCount, url in enumerate(args.url):
         nav_css = epub.EpubItem(uid="style_nav", file_name="style/nav.css", media_type="text/css", content=style)
         book.add_item(nav_css)
 
-        # write to the file
+        # write to the file, the folder with the cover is kept
         epub.write_epub(os.path.join(os.path.dirname(savePath), check_path(f'{name}.epub', fat=args.restrict_characters)), book)
 
-        # remove tmp folder
-        for file in os.listdir(savePath):
-            os.remove(os.path.join(savePath, file))
-        os.removedirs(savePath)
+    if urlCount + 1 != urlTotal:
+        printLine()
+    return True
+
+
+for urlCount, url in enumerate(args.url):
+    if not download_series(url, urlCount, len(args.url)):
+        break
