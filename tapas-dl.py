@@ -6,7 +6,6 @@ import argparse
 import re
 import time
 import requests
-import http.cookiejar
 import img2pdf
 from urllib.parse import urlparse
 
@@ -133,9 +132,24 @@ args = parser.parse_args()
 
 s = requests.Session()
 s.headers.update({'user-agent': 'tapas-dl'})
+def load_cookies(path):
+    # Parse the cookies.txt by hand: MozillaCookieJar before Python 3.10 skips '#HttpOnly_' lines as comments,
+    # and those are the login cookies. Expiry is ignored so the cookies are always sent.
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#HttpOnly_'):
+                line = line[len('#HttpOnly_'):]
+            elif line.startswith('#') or not line.strip():
+                continue
+            fields = line.rstrip('\r\n').split('\t')
+            if len(fields) != 7:
+                continue
+            domain, _, path, secure, _, name, value = fields
+            s.cookies.set(name, value, domain=domain, path=path, secure=secure == 'TRUE')
+
+
 if args.cookies:
-    s.cookies = http.cookiejar.MozillaCookieJar()
-    s.cookies.load(args.cookies, ignore_discard=True, ignore_expires=True)
+    load_cookies(args.cookies)
 # FIXME Those cookies should be set, but no idea how...
 #s.cookies.update({'birthDate': '1901-01-01'})
 #s.cookies.update({'adjustedBirthDate': '1901-01-01'})
